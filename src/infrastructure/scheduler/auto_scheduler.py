@@ -334,6 +334,159 @@ class AutoScheduler:
         )
         return result
 
+    def _normalize_group_entry(
+        self, value: str, defined_ids: set[str]
+    ) -> str | None:
+        """将配置项规范化为 UMO Group ID（仅当已定义时才返回）。"""
+        if not value:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        if self.config_manager.is_umo_group_id(raw):
+            normalized = self.config_manager.normalize_umo_group_id(raw)
+            return normalized if normalized in defined_ids else None
+
+        normalized = self.config_manager.normalize_umo_group_id(raw)
+        if normalized in defined_ids:
+            return normalized
+        return None
+
+    def _is_group_selected(
+        self, group_id: str, mode: str, configured_ids: set[str]
+    ) -> bool:
+        """根据名单模式判断 UMO Group 是否被选中。"""
+        if mode == "whitelist":
+            if not configured_ids:
+                return False
+            return group_id in configured_ids
+        return group_id not in configured_ids
+
+    def _prepare_umo_group_sources(self, source_umos: list[str]) -> list[str]:
+        """过滤并返回可用的来源 UMO（存在适配器且通过基础权限）。"""
+        valid: list[str] = []
+        for umo in source_umos:
+            umo_str = str(umo).strip()
+            if not umo_str:
+                continue
+            platform_id, session_id = self.config_manager.parse_umo_string(umo_str)
+            if not platform_id or not session_id:
+                logger.warning(f"[UMOGroup] 无效来源 UMO，跳过: {umo}")
+                continue
+            if not self.config_manager.is_group_allowed(umo_str):
+                logger.debug(
+                    f"[UMOGroup] 来源 UMO 未通过基础白/黑名单，跳过: {umo_str}"
+                )
+                continue
+            adapter = self.bot_manager.get_adapter(platform_id)
+            if not adapter:
+                logger.warning(
+                    f"[UMOGroup] 平台 {platform_id} 未加载适配器，跳过来源 {umo_str}"
+                )
+                continue
+            valid.append(umo_str)
+        return valid
+
+    def _normalize_output_destinations(self, outputs: list[str]) -> list[dict]:
+        """将输出 UMO 解析为可发送的目标列表。"""
+        destinations: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for umo in outputs:
+            umo_str = str(umo).strip()
+            if not umo_str:
+                continue
+            platform_id, session_id = self.config_manager.parse_umo_string(umo_str)
+            if not platform_id or not session_id:
+                logger.warning(f"[UMOGroup] 无效输出 UMO，跳过: {umo}")
+                continue
+            key = (platform_id, session_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            destinations.append({"platform_id": platform_id, "group_id": session_id})
+        return destinations
+
+    def _get_umo_group_targets(
+        self, mode_filter: str | None = None
+    ) -> list[dict[str, object]]:
+        """解析配置中声明的 UMO Group 目标。"""
+        group_map = self.config_manager.get_umo_group_map()
+        if not group_map:
+            return []
+
+        defined_ids = set(group_map.keys())
+        sched_mode = self.config_manager.get_scheduled_group_list_mode()
+        sched_list = self.config_manager.get_scheduled_group_list()
+        incr_mode = self.config_manager.get_incremental_group_list_mode()
+        incr_list = self.config_manager.get_incremental_group_list()
+
+        sched_ids = {
+            gid
+            for item in sched_list
+            if (gid := self._normalize_group_entry(item, defined_ids))
+        }
+        incr_ids = {
+            gid
+            for item in incr_list
+            if (gid := self._normalize_group_entry(item, defined_ids))
+        }
+
+        targets: list[dict[str, object]] = []
+
+        for gid, cfg in group_map.items():
+            if mode_filter in (None, "traditional"):
+                if self._is_group_selected(gid, sched_mode, sched_ids):
+                    targets.append(
+                        {
+                            "group_id": gid,
+                            "mode": "traditional",
+                            "sources": self._prepare_umo_group_sources(
+                                cfg.get("source_umos", [])
+                            ),
+                            "outputs": self._normalize_output_destinations(
+                                cfg.get("output_umos", [])
+                            ),
+                        }
+                    )
+
+            if mode_filter in (None, "incremental"):
+                if self._is_group_selected(gid, incr_mode, incr_ids):
+                    targets.append(
+                        {
+                            "group_id": gid,
+                            "mode": "incremental",
+                            "sources": self._prepare_umo_group_sources(
+                                cfg.get("source_umos", [])
+                            ),
+                            "outputs": self._normalize_output_destinations(
+                                cfg.get("output_umos", [])
+                            ),
+                        }
+                    )
+
+        filtered: list[dict[str, object]] = []
+        for t in targets:
+            if not t["sources"]:
+                logger.info(
+                    f"[UMOGroup] 组 {t['group_id']} 未找到可用来源，跳过该任务"
+                )
+                continue
+            if not t["outputs"]:
+                logger.info(
+                    f"[UMOGroup] 组 {t['group_id']} 未配置输出 UMO，跳过该任务"
+                )
+                continue
+            filtered.append(t)
+
+        if filtered:
+            logger.info(
+                f"[UMOGroup] 解析到 {len(filtered)} 个 UMO Group 目标"
+                + (f" (模式过滤: {mode_filter})" if mode_filter else "")
+            )
+        return filtered
+
+
     # ================================================================
     # 统一报告调度入口
     # ================================================================
@@ -351,15 +504,18 @@ class AutoScheduler:
             logger.info("定时报告触发 — 开始解析调度目标")
 
             all_targets = await self._get_scheduled_targets()
+            umo_group_targets = self._get_umo_group_targets()
 
-            if not all_targets:
+            if not all_targets and not umo_group_targets:
                 logger.info("没有配置的群聊需要定时分析")
                 return
 
             max_concurrent = self.config_manager.get_max_concurrent_tasks()
             sem = asyncio.Semaphore(max_concurrent)
             logger.info(
-                f"定时报告: {len(all_targets)} 个目标 (并发限制: {max_concurrent})"
+                f"定时报告: {len(all_targets)} 个群目标，"
+                f"{len(umo_group_targets)} 个 UMO Group 目标 "
+                f"(并发限制: {max_concurrent})"
             )
 
             async def dispatch_group(gid, pid, mode):
@@ -373,10 +529,23 @@ class AutoScheduler:
                             gid, pid
                         )
 
+            async def dispatch_umo_group(target: dict):
+                async with sem:
+                    return await self._perform_umo_group_analysis_with_timeout(
+                        target["group_id"],
+                        target["sources"],
+                        target["outputs"],
+                        target["mode"],
+                    )
+
             tasks = []
             stagger = self.config_manager.get_stagger_seconds() or 2
+            combined_targets: list[tuple[str, object]] = [
+                ("group", (gid, pid, mode)) for gid, pid, mode in all_targets
+            ] + [("umo_group", target) for target in umo_group_targets]
+
             # 针对定时大任务加入交错等待，减少瞬间峰值延迟
-            for idx, (gid, pid, mode) in enumerate(all_targets):
+            for idx, entry in enumerate(combined_targets):
                 if self._terminating:
                     logger.info("检测到插件正在停止，取消后续任务创建")
                     break
@@ -385,10 +554,18 @@ class AutoScheduler:
                 if idx > 0 and stagger > 0:
                     await asyncio.sleep(stagger)
 
-                task = asyncio.create_task(
-                    dispatch_group(gid, pid, mode),
-                    name=f"report_{mode}_{gid}",
-                )
+                if entry[0] == "group":
+                    gid, pid, mode = entry[1]
+                    task = asyncio.create_task(
+                        dispatch_group(gid, pid, mode),
+                        name=f"report_{mode}_{gid}",
+                    )
+                else:
+                    target = entry[1]
+                    task = asyncio.create_task(
+                        dispatch_umo_group(target),
+                        name=f"report_{target['mode']}_{target['group_id']}",
+                    )
                 tasks.append(task)
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -399,7 +576,8 @@ class AutoScheduler:
             error_count = 0
 
             for i, result in enumerate(results):
-                gid, _, _ = all_targets[i]
+                label, payload = combined_targets[i]
+                gid = payload[0] if label == "group" else payload["group_id"]
                 if isinstance(result, DuplicateGroupTaskError):
                     skip_count += 1
                 elif isinstance(result, Exception):
@@ -412,7 +590,7 @@ class AutoScheduler:
 
             logger.info(
                 f"定时报告完成 — 成功: {success_count}, 跳过: {skip_count}, "
-                f"失败: {error_count}, 总计: {len(all_targets)}"
+                f"失败: {error_count}, 总计: {len(combined_targets)}"
             )
 
         except Exception as e:
@@ -432,6 +610,26 @@ class AutoScheduler:
             logger.error(f"群 {group_id} 分析超时（30分钟），跳过该群分析")
         except Exception as e:
             logger.error(f"群 {group_id} 分析任务执行失败: {e}")
+
+    async def _perform_umo_group_analysis_with_timeout(
+        self,
+        group_id: str,
+        source_umos: list[str],
+        output_targets: list[dict],
+        mode: str,
+    ):
+        """为 UMO Group 执行聚合分析（带超时控制）。"""
+        try:
+            await asyncio.wait_for(
+                self._perform_umo_group_analysis(
+                    group_id, source_umos, output_targets, mode
+                ),
+                timeout=1800,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[UMOGroup] 组 {group_id} 分析超时（30分钟），跳过该组")
+        except Exception as e:
+            logger.error(f"[UMOGroup] 组 {group_id} 分析任务失败: {e}")
 
     async def _perform_auto_analysis_for_group(
         self, group_id: str, target_platform_id: str | None = None
@@ -489,6 +687,54 @@ class AutoScheduler:
             logger.error(f"群 {group_id} 自动分析执行失败: {e}", exc_info=True)
         finally:
             logger.debug(f"群 {group_id} 自动分析流程结束")
+
+    async def _perform_umo_group_analysis(
+        self,
+        group_id: str,
+        source_umos: list[str],
+        output_targets: list[dict],
+        mode: str,
+    ):
+        """为 UMO Group 执行聚合分析并分发报告。"""
+        try:
+            trace_id = TraceContext.generate(prefix="umoGroup", group_name=group_id)
+            TraceContext.set(trace_id)
+
+            if self._terminating:
+                return
+
+            logger.info(
+                f"[UMOGroup] 开始执行{'增量最终' if mode == 'incremental' else '全量'}分析 "
+                f"(组: {group_id}, 来源数={len(source_umos)}, 输出数={len(output_targets)})"
+            )
+
+            result = await self.analysis_service.execute_daily_analysis_for_sources(
+                group_id=group_id, source_umos=source_umos
+            )
+
+            if not result.get("success"):
+                reason = result.get("reason", "unknown")
+                logger.info(f"[UMOGroup] 组 {group_id} 分析跳过: {reason}")
+                return
+
+            analysis_result = result["analysis_result"]
+
+            for dest in output_targets:
+                await self.report_dispatcher.dispatch(
+                    dest["group_id"],
+                    analysis_result,
+                    dest.get("platform_id"),
+                )
+
+            logger.info(f"[UMOGroup] 组 {group_id} 分析任务执行成功")
+
+        except DuplicateGroupTaskError:
+            logger.debug(f"[UMOGroup] 组 {group_id} 任务因并发锁冲突跳过")
+            raise
+        except Exception as e:
+            logger.error(f"[UMOGroup] 组 {group_id} 分析执行失败: {e}", exc_info=True)
+        finally:
+            logger.debug(f"[UMOGroup] 组 {group_id} 分析流程结束")
 
     # ================================================================
     # 增量模式：增量分析
