@@ -112,9 +112,9 @@ UMO Group（Unified Message Origin Group）是一个强大的功能，允许您�
    - 同时也会被当作来自 `tech_groups` 的消息进行处理
 
 3. **报告发送**: 分析完成后：
-   - 如果该 UMO 属于某个 UMO Group
-   - 报告会自动发送到该 Group 的 `output_umo`
-   - 而不是发送到原始的群组
+   - 如果该 UMO 属于一个或多个 UMO Group
+   - 报告会依次发送到所有匹配 Group 的 `output_umo`
+   - 同时也会发送回原始群组，便于“既属于聚合又保留自身报告”的场景
 
 ### 兼容性
 

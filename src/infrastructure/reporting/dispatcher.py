@@ -46,56 +46,103 @@ class ReportDispatcher:
 
         Note:
             如果 group_id 对应的 UMO 属于某个 UMO Group，
-            报告将自动发送到该 Group 的 output_umo
+            报告将自动发送到该 Group 的 output_umo。
+            如果该 UMO 同时属于多个 UMO Group，或希望原群也接收报告，
+            将按配置依次发送到所有目标。
         """
         trace_id = TraceContext.get()
 
-        # 检查是否需要重定向到 UMO Group 的 output_umo
-        if platform_id:
-            source_umo = f"{platform_id}:GroupMessage:{group_id}"
-            dest_umo = self.config_manager.get_report_destination_umo(source_umo)
-
-            # 如果目标 UMO 与源 UMO 不同，说明需要重定向
-            if dest_umo != source_umo:
-                logger.info(
-                    f"[{trace_id}] 群 {group_id} 属于 UMO Group，重定向报告至: {dest_umo}"
-                )
-                # 解析目标 UMO 以获取目标群组 ID 和平台 ID
-                try:
-                    parts = dest_umo.split(":")
-                    if len(parts) == 3:
-                        target_platform_id = parts[0]
-                        target_group_id = parts[2]
-                        # 使用目标群组和平台发送报告
-                        group_id = target_group_id
-                        platform_id = target_platform_id
-                        logger.info(
-                            f"[{trace_id}] 报告将发送至: platform={target_platform_id}, group={target_group_id}"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"[{trace_id}] 解析目标 UMO 失败: {dest_umo}, 错误: {e}"
-                    )
+        targets = self._resolve_report_targets(group_id, platform_id)
+        if not targets:
+            logger.warning(f"[{trace_id}] 未找到可用的报告发送目标，跳过发送")
+            return
 
         output_format = self.config_manager.get_output_format()
         logger.info(
-            f"[{trace_id}] 正在分发群 {group_id} 的报告 (格式: {output_format})"
+            f"[{trace_id}] 正在分发群 {group_id} 的报告到 {len(targets)} 个目标 (格式: {output_format})"
         )
 
-        success = False
-        if output_format == "image":
-            success = await self._dispatch_image(group_id, analysis_result, platform_id)
-        elif output_format == "pdf":
-            success = await self._dispatch_pdf(group_id, analysis_result, platform_id)
-        elif output_format == "html":
-            success = await self._dispatch_html(group_id, analysis_result, platform_id)
-        else:
-            success = await self._dispatch_text(group_id, analysis_result, platform_id)
+        any_success = False
+        for target in targets:
+            target_group = target["group_id"]
+            target_platform = target["platform_id"]
+            via = target.get("via")
+            logger.info(
+                f"[{trace_id}] 发送目标: platform={target_platform or 'unknown'}, "
+                f"group={target_group} (via {via or 'direct'})"
+            )
+            success = await self._dispatch_to_target(
+                target_group, analysis_result, target_platform, output_format
+            )
+            any_success = any_success or success
+            if not success:
+                logger.warning(
+                    f"[{trace_id}] 群 {target_group} 的报告发送失败 (via {via or 'direct'})"
+                )
 
-        if success:
-            logger.info(f"[{trace_id}] 群 {group_id} 的报告分发成功")
+        if any_success:
+            logger.info(f"[{trace_id}] 报告已发送至至少一个目标")
         else:
-            logger.warning(f"[{trace_id}] 群 {group_id} 的报告分发失败")
+            logger.warning(f"[{trace_id}] 所有目标的报告分发均失败")
+
+    async def _dispatch_to_target(
+        self,
+        group_id: str,
+        analysis_result: dict[str, Any],
+        platform_id: str | None,
+        output_format: str,
+    ) -> bool:
+        """按指定格式向单个目标分发报告"""
+        if output_format == "image":
+            return await self._dispatch_image(group_id, analysis_result, platform_id)
+        if output_format == "pdf":
+            return await self._dispatch_pdf(group_id, analysis_result, platform_id)
+        if output_format == "html":
+            return await self._dispatch_html(group_id, analysis_result, platform_id)
+        return await self._dispatch_text(group_id, analysis_result, platform_id)
+
+    def _resolve_report_targets(
+        self, group_id: str, platform_id: str | None
+    ) -> list[dict[str, str | None]]:
+        """解析报告要发送到的所有目标（支持多重 UMO Group 归属和自发送）"""
+        if not platform_id:
+            return [{"group_id": group_id, "platform_id": platform_id, "via": None}]
+
+        source_umo = f"{platform_id}:GroupMessage:{group_id}"
+        dest_umos = self.config_manager.get_report_destination_umos(source_umo)
+        if not dest_umos:
+            return [{"group_id": group_id, "platform_id": platform_id, "via": None}]
+
+        targets: list[dict[str, str | None]] = []
+        seen: set[str] = set()
+        trace_id = TraceContext.get()
+
+        for dest_umo in dest_umos:
+            parsed = self._parse_umo(dest_umo)
+            if not parsed:
+                logger.warning(
+                    f"[{trace_id}] 解析 UMO 失败，跳过目标: {dest_umo}"
+                )
+                continue
+            target_platform, target_group = parsed
+            key = f"{target_platform}:{target_group}"
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(
+                {"group_id": target_group, "platform_id": target_platform, "via": dest_umo}
+            )
+
+        return targets
+
+    @staticmethod
+    def _parse_umo(umo: str) -> tuple[str, str] | None:
+        """解析 UMO 为 (platform_id, group_id)，失败返回 None。"""
+        parts = umo.split(":")
+        if len(parts) != 3:
+            return None
+        platform, _, group = parts
+        return platform, group
 
     async def _dispatch_image(
         self, group_id: str, analysis_result: dict[str, Any], platform_id: str | None

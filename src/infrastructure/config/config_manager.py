@@ -132,15 +132,12 @@ class ConfigManager:
         # 如果目标不是 UMO Group 引用，还需要检查它是否属于某个被允许的 UMO Group
         if not target.startswith("_umoGroup:") and not is_in_list:
             # 查找该 UMO 所属的 UMO Group
-            group = self.find_umo_group_for_source(target)
-            if group:
-                # 检查该 Group 是否在名单中
+            groups = self.find_umo_groups_for_source(target)
+            for group in groups:
                 group_ref = f"_umoGroup:{group.get('group_id')}"
-                if any(
-                    _is_match(item, group_ref, "", "")
-                    for item in glist
-                ):
+                if any(_is_match(item, group_ref, "", "") for item in glist):
                     is_in_list = True
+                    break
 
         if mode == "whitelist":
             return is_in_list
@@ -627,11 +624,12 @@ class ConfigManager:
 
         # 如果目标不是 UMO Group 引用且没有直接匹配，检查是否属于某个 UMO Group
         if not target.startswith("_umoGroup:") and not direct_match:
-            group = self.find_umo_group_for_source(target)
-            if group:
+            groups = self.find_umo_groups_for_source(target)
+            for group in groups:
                 group_ref = f"_umoGroup:{group.get('group_id')}"
                 if any(match_umo(group_ref, x) for x in group_list):
                     direct_match = True
+                    break
 
         if mode == "whitelist":
             if not group_list:
@@ -951,12 +949,18 @@ class ConfigManager:
 
     def find_umo_group_for_source(self, source_umo: str) -> dict | None:
         """根据来源 UMO 查找其所属的 UMO Group"""
+        groups = self.find_umo_groups_for_source(source_umo)
+        return groups[0] if groups else None
+
+    def find_umo_groups_for_source(self, source_umo: str) -> list[dict]:
+        """根据来源 UMO 查找其所属的所有 UMO Group（支持多重归属）"""
         groups = self.get_umo_groups()
+        matched: list[dict] = []
         for group in groups:
             source_umos = group.get("source_umos", [])
             if source_umo in source_umos:
-                return group
-        return None
+                matched.append(group)
+        return matched
 
     def resolve_umo_group_id(self, identifier: str) -> str | None:
         """
@@ -996,9 +1000,37 @@ class ConfigManager:
         Returns:
             目标 UMO（报告发送目标）
         """
-        group = self.find_umo_group_for_source(source_umo)
-        if group:
+        groups = self.find_umo_groups_for_source(source_umo)
+        for group in groups:
             output_umo = group.get("output_umo")
             if output_umo:
                 return output_umo
         return source_umo
+
+    def get_report_destination_umos(self, source_umo: str) -> list[str]:
+        """
+        获取报告应该发送到的所有目标 UMO 列表（支持多重归属与自发送）。
+
+        返回顺序：
+        1. 所有匹配的 UMO Group 的 output_umo（按配置顺序）
+        2. 原始 source_umo（确保自身也可接收报告）
+
+        去重后返回。
+        """
+        destinations: list[str] = []
+        for group in self.find_umo_groups_for_source(source_umo):
+            output_umo = group.get("output_umo")
+            if output_umo:
+                destinations.append(output_umo)
+
+        # 始终将原始 UMO 也加入目标列表，确保自身可接收报告
+        destinations.append(source_umo)
+
+        # 去重但保持顺序
+        unique: list[str] = []
+        seen: set[str] = set()
+        for item in destinations:
+            if item and item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique
