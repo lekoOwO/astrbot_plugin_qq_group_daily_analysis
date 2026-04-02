@@ -3,6 +3,7 @@
 负责处理插件配置和PDF依赖检查
 """
 
+import re
 import sys
 
 from astrbot.api import AstrBotConfig
@@ -26,6 +27,7 @@ class ConfigManager:
     """
 
     UMO_GROUP_PREFIX = "umoGroup:"
+    UMO_GROUP_ID_INVALID_PATTERN = re.compile(r'[\\/:*?"<>|.;\s\x00-\x1f]')
 
     def __init__(self, config: AstrBotConfig):
         self.config = config
@@ -761,9 +763,17 @@ class ConfigManager:
         group_id = group_id.strip()
         if not group_id:
             return None
-        if group_id.startswith(self.UMO_GROUP_PREFIX):
-            return group_id
-        return f"{self.UMO_GROUP_PREFIX}{group_id}"
+        normalized = (
+            group_id
+            if group_id.startswith(self.UMO_GROUP_PREFIX)
+            else f"{self.UMO_GROUP_PREFIX}{group_id}"
+        )
+
+        raw_id = normalized[len(self.UMO_GROUP_PREFIX) :]
+        if not raw_id or self.UMO_GROUP_ID_INVALID_PATTERN.search(raw_id):
+            logger.warning(f"UMO Group ID 包含非法字符，已忽略: {group_id}")
+            return None
+        return normalized
 
     def is_umo_group_id(self, value: str | None) -> bool:
         """判断字符串是否表示 UMO Group ID。"""

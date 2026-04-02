@@ -708,9 +708,16 @@ class AutoScheduler:
                 f"(组: {group_id}, 来源数={len(source_umos)}, 输出数={len(output_targets)})"
             )
 
-            result = await self.analysis_service.execute_daily_analysis_for_sources(
-                group_id=group_id, source_umos=source_umos
-            )
+            if mode == "incremental":
+                result = await self.analysis_service.execute_incremental_final_report(
+                    group_id=group_id,
+                    platform_id=None,
+                    require_adapter=False,
+                )
+            else:
+                result = await self.analysis_service.execute_daily_analysis_for_sources(
+                    group_id=group_id, source_umos=source_umos
+                )
 
             if not result.get("success"):
                 reason = result.get("reason", "unknown")
@@ -724,6 +731,7 @@ class AutoScheduler:
                     dest["group_id"],
                     analysis_result,
                     dest.get("platform_id"),
+                    report_group_id=group_id,
                 )
 
             logger.info(f"[UMOGroup] 组 {group_id} 分析任务执行成功")
@@ -747,55 +755,77 @@ class AutoScheduler:
         try:
             logger.info("开始执行自动增量分析（并发模式）")
 
-            # 仅选取模式为 incremental 的目标群
             incr_targets = await self._get_scheduled_targets(mode_filter="incremental")
+            incr_umo_groups = self._get_umo_group_targets(mode_filter="incremental")
 
-            if not incr_targets:
+            if not incr_targets and not incr_umo_groups:
                 logger.info("没有配置为增量模式的群聊需要增量分析")
                 return
 
-            target_list = incr_targets
             stagger = self.config_manager.get_incremental_stagger_seconds()
             max_concurrent = self.config_manager.get_max_concurrent_tasks()
 
             logger.info(
-                f"将为 {len(target_list)} 个群聊执行增量分析 "
+                f"将为 {len(incr_targets)} 个群聊与 {len(incr_umo_groups)} 个 UMO Group 执行增量分析 "
                 f"(并发限制: {max_concurrent}, 交错间隔: {stagger}秒)"
             )
 
             sem = asyncio.Semaphore(max_concurrent)
 
-            async def staggered_incremental(idx, gid, pid):
+            async def staggered_incremental(idx, entry):
                 if idx > 0 and stagger > 0:
                     await asyncio.sleep(stagger * idx)
 
                 async with sem:
-                    result = (
-                        await self._perform_incremental_analysis_for_group_with_timeout(
+                    if entry[0] == "group":
+                        gid, pid = entry[1], entry[2]
+                        result = await self._perform_incremental_analysis_for_group_with_timeout(
                             gid, pid
                         )
-                    )
 
-                    # 为调试提供的立即上报选项
-                    if self.config_manager.get_incremental_report_immediately():
-                        if isinstance(result, dict) and result.get("success"):
-                            logger.info(
-                                f"增量分析立即报告模式生效，正在为群 {gid} 生成报告..."
-                            )
-                            await self._perform_incremental_final_report_for_group_with_timeout(
-                                gid, pid
-                            )
+                        if self.config_manager.get_incremental_report_immediately():
+                            if isinstance(result, dict) and result.get("success"):
+                                logger.info(
+                                    f"增量分析立即报告模式生效，正在为群 {gid} 生成报告..."
+                                )
+                                await self._perform_incremental_final_report_for_group_with_timeout(
+                                    gid, pid
+                                )
+                    else:
+                        target = entry[1]
+                        gid = target["group_id"]
+                        result = await self._perform_incremental_analysis_for_umo_group_with_timeout(
+                            gid, target["sources"]
+                        )
+
+                        if self.config_manager.get_incremental_report_immediately():
+                            if isinstance(result, dict) and result.get("success"):
+                                logger.info(
+                                    f"增量分析立即报告模式生效，正在为 UMO 组 {gid} 生成报告..."
+                                )
+                                await self._perform_umo_group_analysis_with_timeout(
+                                    gid, target["sources"], target["outputs"], "incremental"
+                                )
 
                     return result
 
             analysis_tasks = []
-            for idx, (gid, pid, _mode) in enumerate(target_list):
+            combined_targets: list[tuple[str, object]] = [
+                ("group", (gid, pid))
+                for gid, pid, _mode in incr_targets
+            ] + [("umo_group", target) for target in incr_umo_groups]
+
+            for idx, entry in enumerate(combined_targets):
                 if self._terminating:
                     logger.info("检测到插件正在停止，取消后续增量分析任务创建")
                     break
                 task = asyncio.create_task(
-                    staggered_incremental(idx, gid, pid),
-                    name=f"incremental_group_{gid}",
+                    staggered_incremental(idx, entry),
+                    name=(
+                        f"incremental_group_{entry[1][0]}"
+                        if entry[0] == "group"
+                        else f"incremental_umo_group_{entry[1]['group_id']}"
+                    ),
                 )
                 analysis_tasks.append(task)
 
@@ -806,7 +836,8 @@ class AutoScheduler:
             error_count = 0
 
             for i, result in enumerate(results):
-                gid, _, _ = target_list[i]
+                entry = combined_targets[i]
+                gid = entry[1][0] if entry[0] == "group" else entry[1]["group_id"]
                 if isinstance(result, DuplicateGroupTaskError):
                     skip_count += 1
                 elif isinstance(result, Exception):
@@ -819,7 +850,7 @@ class AutoScheduler:
 
             logger.info(
                 f"增量分析完成 - 成功: {success_count}, 跳过: {skip_count}, "
-                f"失败: {error_count}, 总计: {len(target_list)}"
+                f"失败: {error_count}, 总计: {len(combined_targets)}"
             )
 
         except Exception as e:
@@ -897,6 +928,71 @@ class AutoScheduler:
             return {"success": False, "reason": str(e)}
         finally:
             logger.debug(f"群 {group_id} 增量分析流程结束")
+
+    async def _perform_incremental_analysis_for_umo_group_with_timeout(
+        self, group_id: str, source_umos: list[str]
+    ):
+        """为指定 UMO Group 执行增量分析（带超时控制，10分钟）"""
+        try:
+            result = await asyncio.wait_for(
+                self._perform_incremental_analysis_for_umo_group(
+                    group_id, source_umos
+                ),
+                timeout=600,
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.error(f"[UMOGroup] 组 {group_id} 增量分析超时（10分钟），跳过")
+            return {"success": False, "reason": "timeout"}
+        except Exception as e:
+            logger.error(f"[UMOGroup] 组 {group_id} 增量分析任务执行失败: {e}")
+            return {"success": False, "reason": str(e)}
+
+    async def _perform_incremental_analysis_for_umo_group(
+        self, group_id: str, source_umos: list[str]
+    ):
+        """为 UMO Group 执行增量分析（仅累计批次，不发送报告）。"""
+        try:
+            trace_id = TraceContext.generate(prefix="umoGroupIncr", group_name=group_id)
+            TraceContext.set(trace_id)
+
+            if self._terminating:
+                return
+
+            logger.info(
+                f"[UMOGroup] 开始执行增量分析 (组: {group_id}, 来源数={len(source_umos)})"
+            )
+
+            if not self.bot_manager.is_ready_for_auto_analysis():
+                logger.warning(f"[UMOGroup] 组 {group_id} 增量分析跳过：bot管理器未就绪")
+                return {"success": False, "reason": "bot_not_ready"}
+
+            result = await self.analysis_service.execute_incremental_analysis_for_sources(
+                group_id=group_id, source_umos=source_umos
+            )
+
+            if not result.get("success"):
+                reason = result.get("reason", "unknown")
+                logger.info(f"[UMOGroup] 组 {group_id} 增量分析跳过: {reason}")
+                return result
+
+            batch_summary = result.get("batch_summary", {})
+            logger.info(
+                f"[UMOGroup] 组 {group_id} 增量分析完成: "
+                f"消息数={result.get('messages_count', 0)}, "
+                f"话题={batch_summary.get('topics_count', 0)}, "
+                f"金句={batch_summary.get('quotes_count', 0)}"
+            )
+            return result
+
+        except DuplicateGroupTaskError:
+            logger.debug(f"[UMOGroup] 组 {group_id} 增量分析因并发锁冲突而跳过（已在运行）")
+            return {"success": False, "reason": "already_running"}
+        except Exception as e:
+            logger.error(f"[UMOGroup] 组 {group_id} 增量分析执行失败: {e}", exc_info=True)
+            return {"success": False, "reason": str(e)}
+        finally:
+            logger.debug(f"[UMOGroup] 组 {group_id} 增量分析流程结束")
 
     # ================================================================
     # 增量最终报告（单群）与回退逻辑

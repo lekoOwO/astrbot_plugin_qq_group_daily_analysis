@@ -109,7 +109,7 @@
                 "id": {
                     "type": "string",
                     "description": "UMO Group ID",
-                    "hint": "用于标识此 UMO Group，引用时以 umoGroup:ID 的形式填写。"
+                    "hint": "用于标识此 UMO Group，引用时以 umoGroup:ID 的形式填写。仅允许字母、数字、下划线、短横线，禁止包含空格、点号、分号等特殊字符。"
                 },
                 "source_umos": {
                     "type": "list",

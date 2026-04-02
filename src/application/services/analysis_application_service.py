@@ -127,8 +127,8 @@ class AnalysisApplicationService:
             )
 
             # 1. 获取适配器
-            adapter = self.bot_manager.get_adapter(platform_id)
-            if not adapter:
+            adapter = self.bot_manager.get_adapter(platform_id) if platform_id else None
+            if require_adapter and not adapter:
                 raise ValueError(f"未找到平台 {platform_id} 的适配器")
 
             # 飞书平台在分析前进行一次性权限与成员头像预热，避免报告阶段出现大面积默认头像。
@@ -636,8 +636,276 @@ class AnalysisApplicationService:
                 "platform_id": getattr(adapter, "platform_id", platform_id),
             }
 
+    async def execute_incremental_analysis_for_sources(
+        self, group_id: str, source_umos: list[str]
+    ) -> dict[str, Any]:
+        """
+        聚合多个来源的增量消息，生成单个批次并存储到组级增量存储。
+
+        与单群增量分析类似，但会为每个来源维护独立的水位线，
+        批次数据统一归档到 group_id 名下，供后续最终报告合并。
+        """
+        async with self.group_lock(group_id, "incremental"):
+            if not self.incremental_store:
+                raise RuntimeError("增量分析未初始化：缺少 IncrementalStore")
+
+            from ...domain.services.message_cleaner_service import MessageCleanerService
+
+            logger.info(
+                f"[UMOGroup] 开始增量分析: 组 {group_id}, 来源={len(source_umos)}"
+            )
+
+            cleaner = MessageCleanerService()
+            bot_self_ids = self.config_manager.get_bot_self_ids()
+
+            days = self.config_manager.get_analysis_days()
+            max_count = self.config_manager.get_incremental_safe_limit()
+            min_messages = self.config_manager.get_incremental_min_messages()
+
+            combined_messages: list[UnifiedMessage] = []
+            source_watermarks: dict[str, int] = {}
+            platform_hint: str | None = None
+
+            for umo in source_umos:
+                platform_id, session_id = self.config_manager.parse_umo_string(umo)
+                if not platform_id or not session_id:
+                    logger.warning(f"[UMOGroup] 无效的来源 UMO，跳过: {umo}")
+                    continue
+
+                adapter = self.bot_manager.get_adapter(platform_id)
+                if not adapter:
+                    logger.warning(
+                        f"[UMOGroup] 未找到平台 {platform_id} 的适配器，跳过 {umo}"
+                    )
+                    continue
+
+                progress_key = self._build_source_progress_key(group_id, umo)
+                last_ts = await self.incremental_store.get_last_analyzed_timestamp(
+                    progress_key
+                )
+
+                try:
+                    raw_messages = await adapter.fetch_messages(
+                        group_id=session_id,
+                        days=days,
+                        max_count=max_count,
+                        since_ts=last_ts,
+                    )
+                except Exception as e:
+                    logger.warning(f"[UMOGroup] 拉取 {umo} 增量消息失败: {e}")
+                    continue
+
+                if not raw_messages:
+                    continue
+
+                unified_messages = cleaner.clean_messages(
+                    raw_messages, bot_self_ids=bot_self_ids, filter_commands=True
+                )
+
+                if last_ts > 0:
+                    unified_messages = [
+                        msg for msg in unified_messages if msg.timestamp > last_ts
+                    ]
+
+                if not unified_messages:
+                    continue
+
+                combined_messages.extend(unified_messages)
+                source_watermarks[progress_key] = max(
+                    msg.timestamp for msg in unified_messages
+                )
+                if not platform_hint:
+                    platform_hint = platform_id
+
+            if not combined_messages:
+                logger.warning(f"[UMOGroup] 组 {group_id} 增量分析无新消息，跳过")
+                return {"success": False, "reason": "no_messages"}
+
+            combined_messages.sort(key=lambda m: m.timestamp)
+
+            if len(combined_messages) < min_messages:
+                logger.info(
+                    f"[UMOGroup] 组 {group_id} 增量消息数 "
+                    f"({len(combined_messages)}) 未达到阈值 ({min_messages})，跳过本次分析"
+                )
+                return {"success": False, "reason": "below_threshold"}
+
+            statistics = await asyncio.to_thread(
+                self.statistics_service.calculate_group_statistics, combined_messages
+            )
+            user_activity = await asyncio.to_thread(
+                self.analysis_domain_service.analyze_user_activity,
+                combined_messages,
+                bot_self_ids,
+            )
+
+            hourly_msg_counts, hourly_char_counts = self._compute_hourly_counts(
+                combined_messages
+            )
+
+            topics_per_batch = self.config_manager.get_incremental_topics_per_batch()
+            quotes_per_batch = self.config_manager.get_incremental_quotes_per_batch()
+
+            topic_enabled = self.config_manager.get_topic_analysis_enabled()
+            golden_quote_enabled = (
+                self.config_manager.get_golden_quote_analysis_enabled()
+            )
+            chat_quality_enabled = (
+                self.config_manager.get_chat_quality_analysis_enabled()
+            )
+
+            legacy_messages = self.statistics_service._convert_to_legacy_dict(
+                combined_messages
+            )
+            unified_msg_origin = (
+                f"{platform_hint}:GroupMessage:{group_id}"
+                if platform_hint
+                else group_id
+            )
+
+            topics = []
+            golden_quotes = []
+            token_usage = TokenUsage()
+            chat_quality_review = None
+
+            if topic_enabled or golden_quote_enabled or chat_quality_enabled:
+                async with self.llm_semaphore:
+                    logger.debug(f"[LLM] 已进入增量分析队列 (UMO Group: {group_id})")
+                    (
+                        topics,
+                        golden_quotes,
+                        token_usage,
+                        chat_quality_review,
+                    ) = await self.llm_analyzer.analyze_incremental_concurrent(
+                        legacy_messages,
+                        umo=unified_msg_origin,
+                        topics_per_batch=topics_per_batch,
+                        quotes_per_batch=quotes_per_batch,
+                        topic_enabled=topic_enabled,
+                        golden_quote_enabled=golden_quote_enabled,
+                        chat_quality_enabled=chat_quality_enabled,
+                    )
+
+            new_topics = [
+                {
+                    "topic": t.topic,
+                    "contributors": t.contributors,
+                    "detail": t.detail,
+                    "contributor_ids": t.contributor_ids,
+                }
+                for t in topics
+            ]
+
+            new_quotes = [
+                {
+                    "content": q.content,
+                    "sender": q.sender,
+                    "reason": q.reason,
+                    "user_id": q.user_id,
+                }
+                for q in golden_quotes
+            ]
+
+            token_usage_dict = {
+                "prompt_tokens": token_usage.prompt_tokens,
+                "completion_tokens": token_usage.completion_tokens,
+                "total_tokens": token_usage.total_tokens,
+            }
+
+            user_stats = self._convert_user_activity_for_merge(
+                user_activity, combined_messages
+            )
+
+            emoji_stats = {
+                "face_count": statistics.emoji_statistics.face_count,
+                "mface_count": statistics.emoji_statistics.mface_count,
+                "bface_count": statistics.emoji_statistics.bface_count,
+                "sface_count": statistics.emoji_statistics.sface_count,
+                "other_emoji_count": statistics.emoji_statistics.other_emoji_count,
+                "face_details": statistics.emoji_statistics.face_details,
+            }
+
+            chat_quality_dict = None
+            if chat_quality_review:
+                chat_quality_dict = {
+                    "title": chat_quality_review.title,
+                    "subtitle": chat_quality_review.subtitle,
+                    "dimensions": [
+                        {
+                            "name": d.name,
+                            "percentage": d.percentage,
+                            "comment": d.comment,
+                            "color": d.color,
+                        }
+                        for d in chat_quality_review.dimensions
+                    ],
+                    "summary": chat_quality_review.summary,
+                }
+
+            participant_ids = list({msg.sender_id for msg in combined_messages})
+            last_message_timestamp = max(
+                (msg.timestamp for msg in combined_messages), default=0
+            )
+            characters_count = sum(msg.get_text_length() for msg in combined_messages)
+
+            batch = IncrementalBatch(
+                group_id=group_id,
+                timestamp=time_mod.time(),
+                messages_count=len(combined_messages),
+                characters_count=characters_count,
+                hourly_msg_counts={str(k): v for k, v in hourly_msg_counts.items()},
+                hourly_char_counts={str(k): v for k, v in hourly_char_counts.items()},
+                user_stats=user_stats,
+                emoji_stats=emoji_stats,
+                topics=new_topics,
+                golden_quotes=new_quotes,
+                token_usage=token_usage_dict,
+                chat_quality_review=chat_quality_dict,
+                last_message_timestamp=last_message_timestamp,
+                participant_ids=participant_ids,
+            )
+
+            await self.incremental_store.save_batch(batch)
+
+            import time
+
+            safe_now = int(time.time()) + 60
+            for progress_key, ts in source_watermarks.items():
+                safe_ts = min(ts, safe_now)
+                await self.incremental_store.update_last_analyzed_timestamp(
+                    progress_key, safe_ts
+                )
+
+            logger.info(
+                f"[UMOGroup] 组 {group_id} 增量分析完成: "
+                f"消息={len(combined_messages)}, "
+                f"话题={len(new_topics)}, 金句={len(new_quotes)}"
+            )
+
+            return {
+                "success": True,
+                "batch_summary": batch.get_summary(),
+                "messages_count": len(combined_messages),
+                "group_id": group_id,
+                "platform_id": platform_hint,
+            }
+
+    @staticmethod
+    def _build_source_progress_key(group_id: str, source_umo: str) -> str:
+        """构建用于单个来源水位线的进度键，避免非法字符影响 KV。"""
+        def _normalize(value: str) -> str:
+            return "".join(
+                ch if ch.isalnum() or ch in {"_", "-", ":"} else "_"
+                for ch in value
+            )
+
+        return f"{_normalize(group_id)}__{_normalize(source_umo)}"
+
     async def execute_incremental_final_report(
-        self, group_id: str, platform_id: str | None = None
+        self,
+        group_id: str,
+        platform_id: str | None = None,
+        require_adapter: bool = True,
     ) -> dict[str, Any]:
         """
         基于滑动窗口内的增量批次生成最终报告。
@@ -696,8 +964,10 @@ class AnalysisApplicationService:
             )
 
             # 5. 获取适配器（报告发送需要）
-            adapter = self.bot_manager.get_adapter(platform_id)
-            if not adapter:
+            adapter = (
+                self.bot_manager.get_adapter(platform_id) if platform_id else None
+            )
+            if require_adapter and not adapter:
                 raise ValueError(f"未找到平台 {platform_id} 的适配器")
 
             # 6. 执行分析相关的变量准备
